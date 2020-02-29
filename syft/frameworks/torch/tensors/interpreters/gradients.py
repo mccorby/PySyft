@@ -1,6 +1,9 @@
 import torch
+import syft
 from .gradients_core import GradFunc
 from .gradients_core import apply_dim_transformations
+
+from syft.workers.abstract import AbstractWorker
 
 
 class AddBackward(GradFunc):
@@ -68,6 +71,18 @@ class MulBackward(GradFunc):
         grad_self_ = grad * self.other
         grad_other = grad * self.self_ if type(self.self_) == type(self.other) else None
         return (grad_self_, grad_other)
+
+
+class DivBackward(GradFunc):
+    def __init__(self, self_, other):
+        super().__init__(self, self_, other)
+        self.self_ = self_
+        self.other = other
+
+    def gradient(self, grad):
+        assert isinstance(self.other, int)
+        grad_self_ = grad / self.other
+        return (grad_self_,)
 
 
 class PowBackward(GradFunc):

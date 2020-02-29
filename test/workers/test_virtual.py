@@ -1,17 +1,18 @@
 from time import time
 from unittest.mock import patch
 
-import syft as sy
-from syft.exceptions import GetNotPermittedError
-from syft.workers.virtual import VirtualWorker
-from syft.codes import MSGTYPE
-from syft import serde
-
-from syft.frameworks.torch import pointers
-
 import pytest
 import torch
-import torch as th
+
+import syft as sy
+from syft import serde
+from syft.generic.pointers.object_wrapper import ObjectWrapper
+from syft.messaging.message import ObjectMessage
+from syft.messaging.message import ObjectRequestMessage
+from syft.workers.virtual import VirtualWorker
+
+from syft.exceptions import GetNotPermittedError
+from syft.exceptions import ObjectNotFoundError
 
 
 def test_send_msg():
@@ -24,6 +25,9 @@ def test_send_msg():
     # get pointer to local worker
     me = sy.torch.hook.local_worker
 
+    # pending time to simulate lantency (optional)
+    me.message_pending_time = 0.1
+
     # create a new worker (to send the object to)
     worker_id = sy.ID_PROVIDER.pop()
     bob = VirtualWorker(sy.torch.hook, id=f"bob{worker_id}")
@@ -33,10 +37,14 @@ def test_send_msg():
     obj_id = obj.id
 
     # Send data to bob
-    me.send_msg(MSGTYPE.OBJ, obj, bob)
+    start_time = time()
+    me.send_msg(ObjectMessage(obj), bob)
+    elapsed_time = time() - start_time
 
     # ensure that object is now on bob's machine
     assert obj_id in bob._objects
+    # ensure that object was sent 0.1 secs later
+    assert abs(elapsed_time - me.message_pending_time) < 0.1
 
 
 def test_send_msg_using_tensor_api():
@@ -81,8 +89,8 @@ def test_recv_msg():
     obj = torch.Tensor([100, 100])
 
     # create/serialize message
-    msg = (MSGTYPE.OBJ, obj)
-    bin_msg = serde.serialize(msg)
+    message = ObjectMessage(obj)
+    bin_msg = serde.serialize(message)
 
     # have alice receive message
     alice.recv_msg(bin_msg)
@@ -93,15 +101,15 @@ def test_recv_msg():
     # Test 2: get tensor back from alice
 
     # Create message: Get tensor from alice
-    msg = (MSGTYPE.OBJ_REQ, obj.id)
+    message = ObjectRequestMessage((obj.id, None, ""))
 
     # serialize message
-    bin_msg = serde.serialize(msg)
+    bin_msg = serde.serialize(message)
 
     # call receive message on alice
     resp = alice.recv_msg(bin_msg)
 
-    obj_2 = serde.deserialize(resp)
+    obj_2 = sy.serde.deserialize(resp)
 
     # assert that response is correct type
     assert type(resp) == bytes
@@ -188,7 +196,7 @@ def test_search():
     assert len(bob.search("#mnist")) == 1
     assert len(bob.search("#cifar")) == 1
     assert len(bob.search("#not_fun")) == 2
-    assert len(bob.search("#not_fun", "#boston_housing")) == 1
+    assert len(bob.search(["#not_fun", "#boston_housing"])) == 1
 
 
 def test_obj_not_found(workers):
@@ -197,21 +205,19 @@ def test_obj_not_found(workers):
 
     bob = workers["bob"]
 
-    x = th.tensor([1, 2, 3, 4, 5]).send(bob)
+    x = torch.tensor([1, 2, 3, 4, 5]).send(bob)
 
     bob._objects = {}
 
-    try:
+    with pytest.raises(ObjectNotFoundError):
         y = x + x
-    except KeyError as e:
-        assert "If you think this tensor does exist" in str(e)
 
 
 def test_get_not_permitted(workers):
     bob = workers["bob"]
-    with patch.object(th.Tensor, "allowed_to_get") as mock_allowed_to_get:
+    x = torch.tensor([1, 2, 3, 4, 5]).send(bob)
+    with patch.object(torch.Tensor, "allow") as mock_allowed_to_get:
         mock_allowed_to_get.return_value = False
-        x = th.tensor([1, 2, 3, 4, 5]).send(bob)
         with pytest.raises(GetNotPermittedError):
             x.get()
         mock_allowed_to_get.assert_called_once()
@@ -223,17 +229,13 @@ def test_spinup_time(hook):
     spun up inside web frameworks are created quickly enough to not cause timeout errors"""
     data = []
     for i in range(10000):
-        data.append(th.Tensor(5, 5).random_(100))
+        data.append(torch.Tensor(5, 5).random_(100))
     start_time = time()
     dummy = sy.VirtualWorker(hook, id="dummy", data=data)
     end_time = time()
-    assert (end_time - start_time) < 0.05
+    assert (end_time - start_time) < 0.1
 
 
-@pytest.mark.skipif(
-    torch.__version__ >= "1.1",
-    reason="bug in pytorch version 1.1.0, jit.trace returns raw C function",
-)
 def test_send_jit_scriptmodule(hook, workers):  # pragma: no cover
     bob = workers["bob"]
 
@@ -241,8 +243,37 @@ def test_send_jit_scriptmodule(hook, workers):  # pragma: no cover
     def foo(x):
         return x + 2
 
-    foo_wrapper = pointers.ObjectWrapper(obj=foo, id=99)
+    foo_wrapper = ObjectWrapper(obj=foo, id=99)
     foo_ptr = hook.local_worker.send(foo_wrapper, bob)
 
     res = foo_ptr(torch.tensor(4))
     assert res == torch.tensor(6)
+
+
+def test_send_command_whitelist(hook, workers):
+    bob = workers["bob"]
+    whitelisted_methods = {
+        "torch": {"tensor": [1, 2, 3], "rand": (2, 3), "randn": (2, 3), "zeros": (2, 3)}
+    }
+
+    for framework, methods in whitelisted_methods.items():
+        attr = getattr(bob.remote, framework)
+
+        for method, inp in methods.items():
+            x = getattr(attr, method)(inp)
+
+            if "rand" not in method:
+                assert (x.get() == getattr(torch, method)(inp)).all()
+
+
+def test_send_command_not_whitelisted(hook, workers):
+    bob = workers["bob"]
+
+    method_not_exist = "openmind"
+
+    for framework in bob.remote.frameworks:
+        if framework in dir(bob.remote):
+            attr = getattr(bob.remote, framework)
+
+            with pytest.raises(AttributeError):
+                getattr(attr, method_not_exist)

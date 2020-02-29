@@ -3,10 +3,10 @@ import torch
 import syft as sy
 
 # Import Hook
-from syft.frameworks.torch import TorchHook
+from syft.frameworks.torch.hook.hook import TorchHook
 
 # Import grids
-from syft.grid import VirtualGrid
+from syft.grid.private_grid import PrivateGridNetwork
 
 
 def test_sandbox():
@@ -29,6 +29,6 @@ def test_sandbox():
     assert isinstance(hook, TorchHook)  # noqa: F821
 
     assert grid == grid  # noqa: F821
-    assert isinstance(grid, VirtualGrid)  # noqa: F821
+    assert isinstance(grid, PrivateGridNetwork)  # noqa: F821
 
     assert workers == [bob, theo, jason, alice, andy, jon]  # noqa: F821
